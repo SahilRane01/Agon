@@ -4,7 +4,6 @@ import com.aegis.auditor.dto.ModelAuditReport;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
@@ -13,16 +12,16 @@ import java.util.List;
 import java.util.Map;
 
 @Service
-public class GroqAuditService {
+public class GeminiAuditService {
 
-    @Value("${groq.api.key}")
+    @Value("${gemini.api.key}")
     private String apiKey;
 
-    @Value("${groq.api.url}")
+    @Value("${gemini.api.url:https://generativelanguage.googleapis.com/v1beta/models}")
     private String apiUrl;
 
-    @Value("${groq.model}")
-    private String modelName;
+    @Value("${gemini.model:gemini-3.6-flash}")
+    private String defaultModel;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final RestClient restClient = RestClient.create();
@@ -126,47 +125,54 @@ public class GroqAuditService {
             }
             """;
 
-    public ModelAuditReport audit(String docText, String targetModelName) {
-        return audit(docText, targetModelName, null);
-    }
-
     public ModelAuditReport audit(String docText, String targetModelName, String specificModel) {
-        if (docText == null || docText.trim().length() < 100) {
-            System.err.println("WARNING: Document text is empty or under 100 characters! PDF extraction failed.");
-        }
+        String modelToUse = (specificModel != null && !specificModel.isBlank()) ? specificModel : defaultModel;
 
-        String modelToUse = (specificModel != null && !specificModel.isBlank()) ? specificModel : modelName;
-
-        // Groq free tier limit is 8,000 Tokens Per Minute (TPM). Cap at ~24,000 characters to fit within limit.
-        String truncatedText = (docText != null && docText.length() > 24000)
-                ? docText.substring(0, 24000) + "\n[...Document truncated for Groq 8k TPM limit...]"
-                : (docText != null ? docText : "");
-
+        // Gemini handles up to 1,000,000 tokens easily
         String userPrompt = "Model / Document Name: " + targetModelName + "\n\nDocumentation to evaluate:\n"
-                + truncatedText;
+                + (docText != null ? docText : "");
 
         Map<String, Object> requestBody = Map.of(
-                "model", modelToUse,
-                "messages", List.of(
-                        Map.of("role", "system", "content", SYSTEM_PROMPT),
-                        Map.of("role", "user", "content", userPrompt)),
-                "response_format", Map.of("type", "json_object"),
-                "temperature", 0.1);
+                "systemInstruction", Map.of("parts", List.of(Map.of("text", SYSTEM_PROMPT))),
+                "contents", List.of(
+                        Map.of("role", "user", "parts", List.of(Map.of("text", userPrompt)))),
+                "generationConfig", Map.of(
+                        "responseMimeType", "application/json",
+                        "temperature", 0.1));
 
-        String rawResponse = restClient.post()
-                .uri(apiUrl)
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(requestBody)
-                .retrieve()
-                .body(String.class);
+        String base = apiUrl.trim();
+        if (base.contains(":generateContent")) {
+            base = base.substring(0, base.indexOf(":generateContent"));
+            int lastSlash = base.lastIndexOf('/');
+            if (lastSlash != -1) {
+                base = base.substring(0, lastSlash);
+            }
+        }
+        String cleanModel = modelToUse.startsWith("models/") ? modelToUse.substring(7) : modelToUse;
+        String endpoint = base + "/" + cleanModel + ":generateContent";
+        System.out.println("Calling Gemini endpoint: " + endpoint);
+
+        String rawResponse;
+        try {
+            rawResponse = restClient.post()
+                    .uri(java.net.URI.create(endpoint))
+                    .header("x-goog-api-key", apiKey.trim())
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(requestBody)
+                    .retrieve()
+                    .body(String.class);
+        } catch (org.springframework.web.client.HttpStatusCodeException e) {
+            System.err.println("Gemini HTTP Error " + e.getStatusCode() + ": " + e.getResponseBodyAsString());
+            throw e;
+        }
 
         try {
             JsonNode root = objectMapper.readTree(rawResponse);
-            String jsonContent = root.path("choices").get(0).path("message").path("content").asText();
+            JsonNode candidate = root.path("candidates").get(0);
+            String jsonContent = candidate.path("content").path("parts").get(0).path("text").asText();
             return objectMapper.readValue(jsonContent, ModelAuditReport.class);
         } catch (Exception e) {
-            throw new RuntimeException("Audit parsing failed: " + e.getMessage(), e);
+            throw new RuntimeException("Gemini audit parsing failed: " + e.getMessage() + " | Raw: " + rawResponse, e);
         }
     }
 }
